@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>proxy-study front</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 960px; }
+    h2 { margin-top: 2rem; font-size: 1.1rem; }
+    button { margin: 0.25rem 0.5rem 0.25rem 0; padding: 0.4rem 0.8rem; }
+    pre { background: #f4f4f4; padding: 1rem; overflow-x: auto; min-height: 4rem; }
+    .origin { color: #555; }
+  </style>
+</head>
+<body>
+  <h1>proxy-study front</h1>
+  <p class="origin">このページのオリジン: <code id="origin"></code></p>
+
+  <h2>① 素朴な構成: API のポートを直接呼ぶ（別オリジン）</h2>
+  <button data-url="http://localhost:3001/whoami">api-a を直接 (localhost:3001)</button>
+  <button data-url="http://localhost:3002/whoami">api-b を直接 (localhost:3002)</button>
+
+  <h2>② nginx 経由: 同じオリジンの相対パスで呼ぶ</h2>
+  <button data-url="/api/a/whoami">api-a (/api/a/whoami)</button>
+  <button data-url="/api/b/whoami">api-b (/api/b/whoami)</button>
+
+  <h2>結果</h2>
+  <pre id="result">ボタンを押してください。失敗したときは、ブラウザの開発者ツールのコンソールも見てください。</pre>
+
+  <script>
+    document.getElementById("origin").textContent = location.origin;
+    const result = document.getElementById("result");
+
+    for (const btn of document.querySelectorAll("button[data-url]")) {
+      btn.addEventListener("click", async () => {
+        const url = btn.dataset.url;
+        result.textContent = `GET ${url} ...`;
+        try {
+          const res = await fetch(url);
+          const text = await res.text();
+          result.textContent = `GET ${url} -> ${res.status}\n\n${text}`;
+        } catch (e) {
+          // CORS で拒否されると、JS には詳しい理由が渡されず TypeError になる
+          result.textContent = `GET ${url} -> 失敗: ${e}\n\n詳しい理由はコンソールに出ています。`;
+        }
+      });
+    }
+  </script>
+</body>
+</html>

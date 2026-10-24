@@ -1,0 +1,23 @@
+# Step 1: 素朴な構成。それぞれのポートを直接公開する。
+# front は nginx イメージを「静的ファイルを返すだけのサーバ」として使う(プロキシはしない)。
+services:
+  front:
+    image: nginx:stable-alpine
+    ports:
+      - "8000:80"
+    volumes:
+      - ./front:/usr/share/nginx/html:ro
+
+  api-a:
+    build: .
+    environment:
+      INSTANCE: a
+    ports:
+      - "3001:3000"
+
+  api-b:
+    build: .
+    environment:
+      INSTANCE: b
+    ports:
+      - "3002:3000"
