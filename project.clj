@@ -1,7 +1,11 @@
 (defproject proxy-study "0.1.0-SNAPSHOT"
-  :description "FIXME: write description"
+  :description "リバースプロキシ実践編の共通バックエンド"
   :url "https://github.com/atakeuchii/proxy-study"
-  :license {:name "EPL-2.0 OR GPL-2.0-or-later WITH Classpath-exception-2.0"
-            :url "https://www.eclipse.org/legal/epl-2.0/"}
-  :dependencies [[org.clojure/clojure "1.12.5"]]
-  :repl-options {:init-ns proxy-study.core})
+  :dependencies [[org.clojure/clojure "1.12.5"]
+                 [ring/ring-core "1.12.2"]
+                 [ring/ring-jetty-adapter "1.12.2"]
+                 [cheshire "5.13.0"]]
+  :main proxy-study.server
+  :uberjar-name "proxy-study-standalone.jar"
+  :profiles {:uberjar {:aot :all}}
+  :repl-options {:init-ns proxy-study.server})

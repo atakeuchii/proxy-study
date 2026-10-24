@@ -1,0 +1,31 @@
+# Step 2〜4: nginx を唯一の入口にする構成。
+# api-a / api-b には ports を書かない = ホストからは直接届かず、nginx からだけ届く。
+services:
+  proxy:
+    image: nginx:stable-alpine
+    ports:
+      - "80:80"       # Step 2: http
+      - "443:443"     # Step 3: https (TLS終端)
+      - "9001:9001"   # Step 4: L4 で api-a へ
+      - "9002:9002"   # Step 4: L4 で api-b へ
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./front:/usr/share/nginx/html:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - api-a
+      - api-b
+
+  api-a:
+    build: .
+    environment:
+      INSTANCE: a
+      FORCE_HTTPS: ${FORCE_HTTPS:-false}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+
+  api-b:
+    build: .
+    environment:
+      INSTANCE: b
+      FORCE_HTTPS: ${FORCE_HTTPS:-false}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
