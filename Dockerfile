@@ -9,6 +9,6 @@ RUN lein uberjar
 # ---- 実行用のステージ: JRE だけの軽いイメージ ----
 FROM eclipse-temurin:21-jre
 WORKDIR /app
-COPY --from=build /app/target/proxy-study-standalone.jar app.jar
+COPY --from=build /app/target/uberjar/proxy-study-standalone.jar app.jar
 EXPOSE 3000
 CMD ["java", "-jar", "app.jar"]

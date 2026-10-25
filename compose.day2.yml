@@ -1,0 +1,65 @@
+# Day 2 の構成。Day 1 の compose.yml とは別のプロジェクトとして動かす。
+#
+#   client(負荷をかける側) ──→ proxy(nginx: 8001〜8005) ──→ api-a / api-b / api-c
+#          └────────────── 直接 ──────────────────────────→ api-a:3000 (Step 1)
+#
+# 負荷は、ホストからではなく client コンテナの中から、Compose の内部ネットワーク越しにかける。
+# ホストから叩くと Docker のポート公開の中継(L4)が挟まり、その中継もデータを溜め込むため。
+name: proxy-study-day2
+
+x-api: &api
+  build: .
+  image: proxy-study-api:day2
+  # 遅いクライアントの効果を短時間で見やすくするため、送信バッファの上限を 256KB に絞る
+  # (Linux の既定では数 MB まで育ち、数 MB の返事を丸ごと吸収してしまうことがある)
+  sysctls:
+    net.ipv4.tcp_wmem: "4096 16384 262144"
+
+x-api-env: &api-env
+  WORKERS: ${WORKERS:-4}                 # 枠の数。Step 1 は 4 本で始める
+  ACCESS_LOG: "false"                    # 負荷をかけるので 1 行ログは切る
+  SESSION_STORE: ${SESSION_STORE:-memory}  # Step 4 で redis に切り替える
+  JAVA_TOOL_OPTIONS: "-Xmx256m"
+
+services:
+  api-a:
+    <<: *api
+    environment:
+      <<: *api-env
+      INSTANCE: a
+
+  api-b:
+    <<: *api
+    environment:
+      <<: *api-env
+      INSTANCE: b
+
+  api-c:
+    <<: *api
+    environment:
+      <<: *api-env
+      INSTANCE: c
+
+  proxy:
+    image: nginx:stable-alpine
+    volumes:
+      - ./nginx/day2.conf:/etc/nginx/nginx.conf:ro
+    sysctls:
+      net.ipv4.tcp_rmem: "4096 131072 262144"
+      net.ipv4.tcp_wmem: "4096 16384 262144"
+    depends_on:
+      - api-a
+      - api-b
+      - api-c
+
+  redis:
+    image: redis:7-alpine
+
+  client:
+    build: ./client
+    command: ["sleep", "infinity"]       # 何もせず待機する。docker compose exec で中に入って使う
+    volumes:
+      - ./scripts:/scripts:ro
+    # クライアント側の受信バッファも 256KB に絞る(理由は api の送信バッファと同じ)
+    sysctls:
+      net.ipv4.tcp_rmem: "4096 131072 262144"
