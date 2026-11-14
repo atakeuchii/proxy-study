@@ -6,6 +6,7 @@
             [ring.middleware.session :refer [wrap-session]]
             [ring.middleware.session.memory :refer [memory-store]]
             [proxy-study.redis-store :refer [redis-store]]
+            [taoensso.carmine :as car]
             [cheshire.core :as json]
             [clojure.string :as str])
   (:import (java.io OutputStream)
@@ -60,6 +61,23 @@
 
 (defonce ^{:doc "ハンドラの中にいるリクエストの数(返事の書き込み中は含まない)。"}
   in-handler (atom 0))
+
+(defonce ^{:doc "本体の待ち受け(ServerConnector)。障害注入の down で止める・再開する。"}
+  main-connector (atom nil))
+
+;; ---------------------------------------------------------------
+;; 障害注入(Day 3)
+;; 管理用ポートの /fault で切り替える。本体のリクエストに、次のように効く。
+;;   error-rate : この確率で、処理せずに即座に 500 を返す(0.0〜1.0)
+;;   delay-ms   : 処理を「終えた後」、返事を返す前にこの時間だけ待つ
+;;                (注文なら、注文は作られたのに返事だけが遅れる状態になる)
+;;   down       : 本体の待ち受けを閉じる(プロセスは生きたまま。接続は connection refused になる)
+;; ---------------------------------------------------------------
+
+(def ^:private no-fault {:error-rate 0.0 :delay-ms 0 :down false})
+
+(defonce ^{:doc "今の障害注入の状態。"}
+  fault (atom no-fault))
 
 ;; ---------------------------------------------------------------
 ;; ハンドラ
@@ -163,22 +181,125 @@
       :in-handler   @in-handler
       :completed    @counters})))
 
+;; ---------------- 注文(Day 3) ----------------
+;; 注文は Redis に置く(3台で共有する「データベース」の代わり)。
+;;   order:seq      注文番号の連番
+;;   orders         作られた注文の一覧(JSON の文字列のリスト)
+;;   idem:<キー>    冪等キーごとの処理結果("processing" または返事の JSON)
+
+(def ^:private redis-conn
+  {:pool (car/connection-pool {}) :spec {:uri redis-uri}})
+
+(defmacro ^:private wcar* [& body]
+  `(car/wcar redis-conn ~@body))
+
+(def ^:private idem-ttl-seconds
+  "冪等キーを覚えておく時間(24時間)。"
+  86400)
+
+(defn- create-order!
+  "注文を1件作って、その内容を返す。"
+  [req]
+  (let [id    (wcar* (car/incr "order:seq"))
+        order {:order-id        id
+               :instance        instance
+               :request-id      (get-in req [:headers "x-request-id"])
+               :idempotency-key (get-in req [:headers "idempotency-key"])}]
+    (wcar* (car/rpush "orders" (json/generate-string order)))
+    order))
+
+(defn create-order
+  "POST /orders : 注文を1件作る。
+   Idempotency-Key ヘッダーがあれば、同じキーで2回目以降に来たときは注文を作らず、1回目の結果を返す。"
+  [req]
+  (if-let [k (get-in req [:headers "idempotency-key"])]
+    (let [rk      (str "idem:" k)
+          ;; キーを「処理中」として登録する。NX = まだ無いときだけ登録できる
+          claimed (wcar* (car/set rk "processing" "NX" "EX" idem-ttl-seconds))]
+      (if (= "OK" claimed)
+        ;; 初めてのキー → 注文を作り、結果を覚えておく
+        (let [order (create-order! req)]
+          (wcar* (car/set rk (json/generate-string order) "EX" idem-ttl-seconds))
+          (json-response 201 (assoc order :replayed false)))
+        ;; 見たことのあるキー
+        (let [saved (wcar* (car/get rk))]
+          (if (= "processing" saved)
+            ;; 1回目がまだ処理中
+            (json-response 409 {:instance instance :error "same key is being processed"})
+            ;; 1回目の結果をそのまま返す(注文は作らない)
+            (json-response 200 (assoc (json/parse-string saved true)
+                                      :replayed true
+                                      :answered-by instance))))))
+    (json-response 201 (create-order! req))))
+
+(defn list-orders
+  "GET /orders : これまでに作られた注文の数と、最後の10件。"
+  [_]
+  (let [total  (wcar* (car/llen "orders"))
+        latest (wcar* (car/lrange "orders" -10 -1))]
+    (json-response 200 {:total  total
+                        :latest (mapv #(json/parse-string % true) latest)})))
+
+(defn reset-orders
+  "DELETE /orders : 注文と冪等キーを全部消す(実験のやり直し用)。"
+  [_]
+  (let [idem-keys (wcar* (car/keys "idem:*"))]
+    (wcar* (car/del "orders" "order:seq"))
+    (when (seq idem-keys)
+      (wcar* (apply car/del idem-keys)))
+    (json-response 200 {:reset true})))
+
 (defn routes [req]
   (case [(:request-method req) (:uri req)]
-    [:get "/whoami"]  (whoami req)
-    [:get "/big"]     (big req)
-    [:get "/slow"]    (slow req)
-    [:get "/session"] (session-count req)
+    [:get "/whoami"]     (whoami req)
+    [:get "/big"]        (big req)
+    [:get "/slow"]       (slow req)
+    [:get "/session"]    (session-count req)
+    [:post "/orders"]    (create-order req)
+    [:get "/orders"]     (list-orders req)
+    [:delete "/orders"]  (reset-orders req)
     (json-response 404 {:instance instance
                         :error    "not found"
                         :uri      (:uri req)})))
 
-(defn admin-routes
-  "管理用ポートのハンドラ。/stats だけを返す。"
+;; ---------------- 管理用ポート ----------------
+
+(defn- set-down!
+  "本体の待ち受けを閉じる(true)・開き直す(false)。"
+  [down?]
+  (let [^ServerConnector c @main-connector]
+    (if down?
+      (when (.isStarted c) (.stop c))
+      (when-not (.isStarted c) (.start c)))))
+
+(defn update-fault
+  "POST /fault?error-rate=&delay-ms=&down= : 障害注入の状態を変える。指定したものだけ変わる。
+   POST /fault?reset=true で、すべて元に戻す。"
   [req]
-  (if (= [:get "/stats"] [(:request-method req) (:uri req)])
-    (stats req)
+  (let [p   (:query-params req)
+        new (if (= "true" (get p "reset"))
+              no-fault
+              (cond-> @fault
+                (get p "error-rate") (assoc :error-rate (Double/parseDouble (get p "error-rate")))
+                (get p "delay-ms")   (assoc :delay-ms (Long/parseLong (get p "delay-ms")))
+                (get p "down")       (assoc :down (= "true" (get p "down")))))]
+    (set-down! (:down new))
+    (reset! fault new)
+    (println (format "[%s] fault changed: %s" instance (pr-str new)))
+    (flush)
+    (json-response 200 (assoc new :instance instance))))
+
+(defn admin-routes*
+  [req]
+  (case [(:request-method req) (:uri req)]
+    [:get "/stats"]  (stats req)
+    [:get "/fault"]  (json-response 200 (assoc @fault :instance instance))
+    [:post "/fault"] (update-fault req)
     (json-response 404 {:instance instance :error "not found" :uri (:uri req)})))
+
+(def admin-routes
+  "管理用ポートのハンドラ。/stats と /fault を返す。"
+  (wrap-params admin-routes*))
 
 ;; ---------------------------------------------------------------
 ;; ミドルウェア
@@ -194,6 +315,19 @@
                       (when-let [q (:query-string req)] (str "?" q)))]
         {:status 302 :headers {"Location" url} :body ""})
       (handler req))))
+
+(defn wrap-fault
+  "障害注入。error-rate の確率で処理せずに 500 を返す。
+   そうでなければ処理して、返事を返す前に delay-ms だけ待つ。"
+  [handler]
+  (fn [req]
+    (let [{:keys [error-rate delay-ms]} @fault]
+      (if (< (rand) error-rate)
+        (json-response 500 {:instance instance :error "injected failure"})
+        (let [res (handler req)]
+          (when (pos? delay-ms)
+            (Thread/sleep delay-ms))
+          res)))))
 
 (defn wrap-stats
   "ハンドラの中にいる数と、処理し終えた件数(パスごと)を数える。"
@@ -213,7 +347,7 @@
     handler
     (fn [req]
       (let [res (handler req)]
-        (println (format "[%s] %s %s from=%s host=%s xff=%s xfp=%s -> %d"
+        (println (format "[%s] %s %s from=%s host=%s xff=%s xfp=%s rid=%s -> %d"
                          instance
                          (str/upper-case (name (:request-method req)))
                          (:uri req)
@@ -221,6 +355,7 @@
                          (get-in req [:headers "host"])
                          (get-in req [:headers "x-forwarded-for"])
                          (get-in req [:headers "x-forwarded-proto"])
+                         (get-in req [:headers "x-request-id"])   ; Day 3: nginx が付けるリクエスト ID
                          (:status res)))
         (flush)
         res))))
@@ -236,6 +371,7 @@
                      :cookie-name "ps-session"})
       wrap-params
       wrap-force-https
+      wrap-fault          ; Day 3: 障害注入(500 を返した場合も、下の2つで数え・ログに出す)
       wrap-stats
       wrap-log))
 
@@ -253,8 +389,8 @@
     (.setReservedThreads 0)))
 
 (defn- add-connector!
-  "acceptor 1本、selector 1本の待ち受けを作る。"
-  [^Server server port]
+  "acceptor 1本、selector 1本の待ち受けを作って、それを返す。"
+  ^ServerConnector [^Server server port]
   (let [factory   (HttpConnectionFactory. (HttpConfiguration.))
         connector (ServerConnector. server (int 1) (int 1)
                                     ^"[Lorg.eclipse.jetty.server.ConnectionFactory;"
@@ -262,7 +398,8 @@
     (doto connector
       (.setHost "0.0.0.0")   ; コンテナの外(nginx など)から届くように
       (.setPort port))
-    (.addConnector server connector)))
+    (.addConnector server connector)
+    connector))
 
 (defn -main [& _]
   (let [port       (Integer/parseInt (env "PORT" "3000"))
@@ -283,5 +420,5 @@
     (jetty/run-jetty (make-app)
                      {:thread-pool  pool
                       :http?        false   ; 既定の待ち受けは作らず、configurator で作る
-                      :configurator #(add-connector! % port)
+                      :configurator #(reset! main-connector (add-connector! % port))
                       :join?        true})))
