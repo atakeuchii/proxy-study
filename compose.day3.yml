@@ -1,0 +1,51 @@
+# Day 3 の構成。
+#
+#   client ──→ proxy(nginx: 8101〜8106) ──→ api-a / api-b / api-c ──→ redis(注文と冪等キー)
+#                                            └ 管理用ポート 9100: /stats と /fault(障害注入)
+name: proxy-study-day3
+
+x-api: &api
+  build: .
+  image: proxy-study-api:day3
+
+x-api-env: &api-env
+  WORKERS: 8
+  ACCESS_LOG: "true"     # 今日はアプリのログでリクエスト ID を突き合わせるので、1行ログを出す
+  JAVA_TOOL_OPTIONS: "-Xmx256m"
+
+services:
+  api-a:
+    <<: *api
+    environment:
+      <<: *api-env
+      INSTANCE: a
+    depends_on: [redis]
+
+  api-b:
+    <<: *api
+    environment:
+      <<: *api-env
+      INSTANCE: b
+    depends_on: [redis]
+
+  api-c:
+    <<: *api
+    environment:
+      <<: *api-env
+      INSTANCE: c
+    depends_on: [redis]
+
+  proxy:
+    image: nginx:stable-alpine
+    volumes:
+      - ./nginx/day3.conf:/etc/nginx/nginx.conf:ro
+    depends_on: [api-a, api-b, api-c]
+
+  redis:
+    image: redis:7-alpine
+
+  client:
+    build: ./client
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./scripts:/scripts:ro
