@@ -12,6 +12,7 @@
   (:import (java.io OutputStream)
            (org.eclipse.jetty.server ConnectionFactory HttpConfiguration
                                      HttpConnectionFactory Server ServerConnector)
+           (org.eclipse.jetty.server.handler StatisticsHandler)
            (org.eclipse.jetty.util.thread QueuedThreadPool))
   (:gen-class))
 
@@ -48,6 +49,14 @@
 
 (def redis-uri
   (env "REDIS_URI" "redis://redis:6379"))
+
+(def version
+  "アプリの版(Day 4)。旧版 v1 と新版 v2 を見分けるため。"
+  (env "VERSION" "v1"))
+
+(def graceful?
+  "true なら、SIGTERM を受けたときにグレースフルシャットダウンする(Day 4)。"
+  (= "true" (env "GRACEFUL" "false")))
 
 ;; ---------------------------------------------------------------
 ;; 計測用の状態
@@ -108,6 +117,7 @@
   (json-response
    200
    {:instance         instance
+    :version          version
     :remote-addr      (:remote-addr req)
     :scheme           (name (:scheme req))
     :effective-scheme (name (effective-scheme req))
@@ -151,7 +161,7 @@
   [req]
   (let [ms (param-long req "ms" 1000)]
     (Thread/sleep ms)
-    (json-response 200 {:instance instance :slept-ms ms})))
+    (json-response 200 {:instance instance :version version :slept-ms ms})))
 
 (defn session-count
   "GET /session : セッションでアクセス回数を数える。"
@@ -254,6 +264,7 @@
     [:get "/whoami"]     (whoami req)
     [:get "/big"]        (big req)
     [:get "/slow"]       (slow req)
+    [:post "/slow"]      (slow req)   ; Day 4: nginx がやり直さない(POST)ことを利用して、切れたリクエストを数える
     [:get "/session"]    (session-count req)
     [:post "/orders"]    (create-order req)
     [:get "/orders"]     (list-orders req)
@@ -406,9 +417,14 @@
         admin-port (Integer/parseInt (env "ADMIN_PORT" "9100"))
         pool       (make-thread-pool "jetty" workers)]
     (reset! thread-pool pool)
-    (println (format "starting instance=%s port=%d admin-port=%d workers=%d session=%s force-https=%s trust-proxy=%s access-log=%s"
-                     instance port admin-port workers session-store-type
-                     force-https? trust-proxy? access-log?))
+    (println (format "starting instance=%s version=%s port=%d admin-port=%d workers=%d session=%s graceful=%s access-log=%s"
+                     instance version port admin-port workers session-store-type
+                     graceful? access-log?))
+    ;; SIGTERM を受けたことをログに出す(graceful? によらず)
+    (.addShutdownHook (Runtime/getRuntime)
+                      (Thread. #(do (println (format "[%s] SIGTERM received (graceful=%s, in-handler=%d)"
+                                                     instance graceful? @in-handler))
+                                    (flush))))
     (flush)
     ;; 管理用ポート(/stats)。本体とは別のスレッドプールで動かす
     (jetty/run-jetty admin-routes
@@ -420,5 +436,18 @@
     (jetty/run-jetty (make-app)
                      {:thread-pool  pool
                       :http?        false   ; 既定の待ち受けは作らず、configurator で作る
-                      :configurator #(reset! main-connector (add-connector! % port))
-                      :join?        true})))
+                      :configurator (fn [^Server server]
+                                      (reset! main-connector (add-connector! server port))
+                                      ;; ★ Day 4: グレースフルシャットダウン
+                                      (when graceful?
+                                        ;; 処理中のリクエストを数える部品を、アプリの手前に挟む
+                                        (.setHandler server (doto (StatisticsHandler.)
+                                                              (.setHandler (.getHandler server))))
+                                        ;; 止めるときは、処理中のリクエストが終わるのを最大30秒待つ
+                                        (.setStopTimeout server 30000)
+                                        ;; SIGTERM を受けたら、上の手順で止める
+                                        ;; (新しい接続の受け付けをやめる → 処理中のものを待つ → 止まる)
+                                        (.setStopAtShutdown server true)))
+                      :join?        true})
+    (println (format "[%s] stopped" instance))
+    (flush)))

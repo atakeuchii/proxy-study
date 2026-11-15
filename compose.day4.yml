@@ -1,0 +1,43 @@
+# Day 4 の構成。
+#
+#   client ──→ proxy(nginx: 8201〜8204) ──→ api-a(旧版 v1) / api-b(新版 v2)
+name: proxy-study-day4
+
+x-api: &api
+  build: .
+  image: proxy-study-api:day4
+  stop_grace_period: 30s     # docker stop が SIGKILL に切り替えるまでの猶予(既定 10 秒)
+
+x-api-env: &api-env
+  WORKERS: 16
+  ACCESS_LOG: "true"
+  GRACEFUL: ${GRACEFUL:-false}   # Step 2 で true にする
+  JAVA_TOOL_OPTIONS: "-Xmx256m"
+
+services:
+  api-a:
+    <<: *api
+    environment:
+      <<: *api-env
+      INSTANCE: a
+      VERSION: v1
+
+  api-b:
+    <<: *api
+    environment:
+      <<: *api-env
+      INSTANCE: b
+      VERSION: v2
+
+  proxy:
+    image: nginx:stable-alpine
+    volumes:
+      - ./nginx/day4.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/day4-active:/etc/nginx/day4-active:ro   # Step 3 で書き換えるファイルの置き場所
+    depends_on: [api-a, api-b]
+
+  client:
+    build: ./client
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./scripts:/scripts:ro
