@@ -5,11 +5,15 @@
             [ring.middleware.params :refer [wrap-params]]
             [ring.middleware.session :refer [wrap-session]]
             [ring.middleware.session.memory :refer [memory-store]]
+            [ring.websocket :as ws]
             [proxy-study.redis-store :refer [redis-store]]
             [taoensso.carmine :as car]
             [cheshire.core :as json]
             [clojure.string :as str])
-  (:import (java.io OutputStream)
+  (:import (java.io InputStream OutputStream)
+           (java.time LocalTime)
+           (java.time.format DateTimeFormatter)
+           (org.eclipse.jetty.io ConnectionStatistics)
            (org.eclipse.jetty.server ConnectionFactory HttpConfiguration
                                      HttpConnectionFactory Server ServerConnector)
            (org.eclipse.jetty.server.handler StatisticsHandler)
@@ -70,6 +74,9 @@
 
 (defonce ^{:doc "ハンドラの中にいるリクエストの数(返事の書き込み中は含まない)。"}
   in-handler (atom 0))
+
+(defonce ^{:doc "本体の待ち受けが受け付けた接続の数を数える部品(Day 5)。"}
+  conn-stats (atom nil))
 
 (defonce ^{:doc "本体の待ち受け(ServerConnector)。障害注入の down で止める・再開する。"}
   main-connector (atom nil))
@@ -189,7 +196,89 @@
       :queued       (.getQueueSize pool)
       ;; ハンドラの中にいる数。返事の書き込み中は含まないので、busy-workers との差が「書き込みで拘束されている数」
       :in-handler   @in-handler
+      ;; Day 5: これまでに受け付けた TCP 接続の数(nginx が接続を使い回すと、増え方が遅くなる)
+      :connections-total (some-> ^ConnectionStatistics @conn-stats .getConnectionsTotal)
       :completed    @counters})))
+
+;; ---------------- Day 5: 長い接続と大きなデータ ----------------
+
+(def ^:private hms (DateTimeFormatter/ofPattern "HH:mm:ss"))
+
+(defn- sse-body
+  "SSE の本文。n 件のイベントを interval-ms ごとに書き、1件ごとに flush する。
+   heartbeat-ms > 0 なら、イベントの間にその間隔でコメント行(: ping)を書く。"
+  [n interval-ms heartbeat-ms]
+  (reify protocols/StreamableResponseBody
+    (write-body-to-stream [_ _ out]
+      (let [^OutputStream out out
+            write! (fn [^String s]
+                     (.write out (.getBytes s "UTF-8"))
+                     ;; ★ 1件ごとに flush する。しないと Jetty の出力バッファ(32KB)に溜まってしまう
+                     (.flush out))
+            ;; ms ミリ秒待つ。heartbeat があれば、その間隔で ping を書く
+            wait! (fn [ms]
+                    (if (pos? heartbeat-ms)
+                      (loop [left ms]
+                        (when (pos? left)
+                          (let [t (min left heartbeat-ms)]
+                            (Thread/sleep t)
+                            (when (and (= t heartbeat-ms) (< t left))
+                              (write! ": ping\n\n"))
+                            (recur (- left t)))))
+                      (Thread/sleep ms)))]
+        (try
+          (doseq [i (range 1 (inc n))]
+            (write! (str "data: " (json/generate-string
+                                   {:n i :at (.format (LocalTime/now) hms) :instance instance})
+                         "\n\n"))
+            (when (< i n) (wait! interval-ms)))
+          (catch java.io.IOException _
+            ;; 相手(nginx やブラウザ)が接続を切った
+            (println (format "[%s] /events: connection closed by peer" instance))
+            (flush))
+          (finally
+            (.close out)))))))
+
+(defn events
+  "GET /events?n=&interval-ms=&heartbeat-ms=&accel= : SSE でイベントを流す。
+   accel=no なら、返事に X-Accel-Buffering: no を付ける(nginx にこの返事だけバッファリングをやめさせる)。"
+  [req]
+  (let [n            (param-long req "n" 30)
+        interval-ms  (param-long req "interval-ms" 1000)
+        heartbeat-ms (param-long req "heartbeat-ms" 0)]
+    {:status  200
+     :headers (cond-> {"Content-Type"  "text/event-stream"
+                       "Cache-Control" "no-cache"}
+                (= "no" (get-in req [:query-params "accel"])) (assoc "X-Accel-Buffering" "no"))
+     :body    (sse-body n interval-ms heartbeat-ms)}))
+
+(defn websocket
+  "GET /ws : WebSocket のエコー。受け取ったメッセージを、そのまま送り返す。
+   WebSocket への切り替えの依頼(Upgrade ヘッダー)が届いていなければ、426 を返す。"
+  [req]
+  (if (ws/upgrade-request? req)
+    {::ws/listener
+     {:on-open    (fn [_] (println (format "[%s] /ws: opened" instance)) (flush))
+      :on-message (fn [socket msg] (ws/send socket (str "echo from " instance ": " msg)))
+      :on-close   (fn [_ code reason]
+                    (println (format "[%s] /ws: closed code=%s reason=%s" instance code reason))
+                    (flush))}}
+    (json-response 426 {:instance instance
+                        :error    "WebSocket upgrade request expected"
+                        :received {:upgrade    (get-in req [:headers "upgrade"])
+                                   :connection (get-in req [:headers "connection"])}})))
+
+(defn upload
+  "POST /upload : 本文を読み切って、そのバイト数を返す(中身は捨てる)。"
+  [req]
+  (let [^InputStream in (:body req)
+        buf (byte-array 65536)
+        n   (if in
+              (loop [total 0]
+                (let [k (.read in buf)]
+                  (if (neg? k) total (recur (+ total k)))))
+              0)]
+    (json-response 200 {:instance instance :received-bytes n})))
 
 ;; ---------------- 注文(Day 3) ----------------
 ;; 注文は Redis に置く(3台で共有する「データベース」の代わり)。
@@ -269,6 +358,9 @@
     [:post "/orders"]    (create-order req)
     [:get "/orders"]     (list-orders req)
     [:delete "/orders"]  (reset-orders req)
+    [:get "/events"]     (events req)      ; Day 5
+    [:get "/ws"]         (websocket req)   ; Day 5
+    [:post "/upload"]    (upload req)      ; Day 5
     (json-response 404 {:instance instance
                         :error    "not found"
                         :uri      (:uri req)})))
@@ -438,6 +530,10 @@
                       :http?        false   ; 既定の待ち受けは作らず、configurator で作る
                       :configurator (fn [^Server server]
                                       (reset! main-connector (add-connector! server port))
+                                      ;; Day 5: 受け付けた接続の数を数える
+                                      (let [cs (ConnectionStatistics.)]
+                                        (.addBean ^ServerConnector @main-connector cs)
+                                        (reset! conn-stats cs))
                                       ;; ★ Day 4: グレースフルシャットダウン
                                       (when graceful?
                                         ;; 処理中のリクエストを数える部品を、アプリの手前に挟む

@@ -1,0 +1,28 @@
+# Day 5 の構成。
+#
+#   client ──→ proxy(nginx: 8301〜8303) ──→ api-a
+#     └──────────── 直接 ──────────────────→ api-a:3000(比べるため)
+name: proxy-study-day5
+
+services:
+  api-a:
+    build: .
+    image: proxy-study-api:day5
+    environment:
+      INSTANCE: a
+      WORKERS: 16
+      ACCESS_LOG: "true"
+      JAVA_TOOL_OPTIONS: "-Xmx256m"
+
+  proxy:
+    # image: nginx:stable-alpine
+    image: nginx:1.24-alpine
+    volumes:
+      - ./nginx/day5.conf:/etc/nginx/nginx.conf:ro
+    depends_on: [api-a]
+
+  client:
+    build: ./client
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./scripts:/scripts:ro
