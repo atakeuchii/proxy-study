@@ -1,0 +1,28 @@
+# Day 6 の構成。
+#
+#   client ──→ proxy(nginx: 8401〜8404) ──→ api-a
+name: proxy-study-day6
+
+services:
+  api-a:
+    build: .
+    image: proxy-study-api:day6
+    environment:
+      INSTANCE: a
+      WORKERS: 8              # 枠8本、描画200ms → キャッシュなしなら毎秒40件が上限の見込み
+      RENDER_MS: 200
+      ACCESS_LOG: "false"     # 負荷をかけるので 1行ログは切る
+      JAVA_TOOL_OPTIONS: "-Xmx256m"
+
+  proxy:
+    image: nginx:stable-alpine
+    volumes:
+      - ./nginx/day6.conf:/etc/nginx/nginx.conf:ro
+    depends_on: [api-a]
+
+  client:
+    build: ./client
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./scripts:/scripts:ro
+      

@@ -75,6 +75,8 @@
 (defonce ^{:doc "ハンドラの中にいるリクエストの数(返事の書き込み中は含まない)。"}
   in-handler (atom 0))
 
+(declare render-counts routes*)   ; Day 6: 後ろで定義する
+
 (defonce ^{:doc "本体の待ち受けが受け付けた接続の数を数える部品(Day 5)。"}
   conn-stats (atom nil))
 
@@ -198,6 +200,8 @@
       :in-handler   @in-handler
       ;; Day 5: これまでに受け付けた TCP 接続の数(nginx が接続を使い回すと、増え方が遅くなる)
       :connections-total (some-> ^ConnectionStatistics @conn-stats .getConnectionsTotal)
+      ;; Day 6: 記事ごとの描画回数
+      :renders      @render-counts
       :completed    @counters})))
 
 ;; ---------------- Day 5: 長い接続と大きなデータ ----------------
@@ -348,7 +352,47 @@
       (wcar* (apply car/del idem-keys)))
     (json-response 200 {:reset true})))
 
+;; ---------------- Day 6: 記事ページ ----------------
+
+(def render-ms
+  "記事の描画にかかる時間(ミリ秒)。重いページの代わり。"
+  (Long/parseLong (env "RENDER_MS" "200")))
+
+(defonce ^{:doc "記事ごとの、これまでに描画した回数(= アプリまで届いた回数)。"}
+  render-counts (atom {}))
+
+(defn- login-user
+  "Cookie の user=... から、ログイン中のユーザー名を取り出す(なければ nil)。"
+  [req]
+  (some->> (get-in req [:headers "cookie"])
+           (re-find #"(?:^|;\s*)user=([^;]+)")
+           second))
+
+(defn article
+  "GET /articles/:id : 記事ページ。描画に render-ms かかる。
+   ★ 右上の「ログイン中」は、Cookie から見ている人ごとに変わる。
+   ★ それなのに、どの返事にも Cache-Control: public, max-age=10 を付けている(Step 4 の事故の原因)。"
+  [req]
+  (let [id    (subs (:uri req) (count "/articles/"))
+        user  (login-user req)
+        n     (get (swap! render-counts update id (fnil inc 0)) id)]
+    (Thread/sleep render-ms)                            ; 重い描画の代わり
+    {:status  200
+     :headers {"Content-Type"  "text/plain; charset=utf-8"
+               "Cache-Control" "public, max-age=10"}    ; 「誰の返事として、10秒使い回してよい」
+     :body    (str "記事 " id "\n"
+                   "ログイン中: " (or user "(ゲスト)") "\n"
+                   "描画したサーバ: " instance "\n"
+                   "描画した時刻: " (.format (LocalTime/now) hms) "\n"
+                   "この記事の描画回数: " n "\n")}))
+
 (defn routes [req]
+  (if (and (= :get (:request-method req))
+           (str/starts-with? (:uri req) "/articles/"))
+    (article req)                                       ; Day 6
+    (routes* req)))
+
+(defn routes* [req]
   (case [(:request-method req) (:uri req)]
     [:get "/whoami"]     (whoami req)
     [:get "/big"]        (big req)
