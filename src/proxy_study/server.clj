@@ -386,6 +386,45 @@
                    "描画した時刻: " (.format (LocalTime/now) hms) "\n"
                    "この記事の描画回数: " n "\n")}))
 
+;; ---------------- Day 7: IP で守った管理画面 ----------------
+
+(def admin-ip-source
+  "管理画面で「クライアントの IP」をどこから取るか(Day 7)。
+     xff-left  : X-Forwarded-For の左端(よくある間違い。クライアントが自由に書ける)
+     x-real-ip : nginx が付ける X-Real-IP(nginx が realip で求めた値を信じる)"
+  (env "ADMIN_IP_SOURCE" "xff-left"))
+
+(def admin-allow-prefix
+  "管理画面を許す IP の先頭(社内ネットワークの代わり)。"
+  (env "ADMIN_ALLOW_PREFIX" "10."))
+
+(defn- client-ip
+  "アプリが「クライアントの IP」だと判断するもの。"
+  [req]
+  (case admin-ip-source
+    ;; ★ 左端を使う。X-Forwarded-For: 10.0.0.5, 172.18.0.3 なら 10.0.0.5
+    "xff-left"  (some-> (get-in req [:headers "x-forwarded-for"])
+                        (str/split #",")
+                        first
+                        str/trim)
+    ;; ★ nginx が求めて渡してきた値を使う
+    "x-real-ip" (get-in req [:headers "x-real-ip"])
+    (:remote-addr req)))
+
+(defn admin
+  "GET /admin : 社内(admin-allow-prefix で始まる IP)からだけ見られる管理画面。"
+  [req]
+  (let [ip (client-ip req)
+        ok (boolean (some-> ip (str/starts-with? admin-allow-prefix)))]
+    (json-response (if ok 200 403)
+                   {:instance        instance
+                    :result          (if ok "管理画面へようこそ" "社内からのみアクセスできます")
+                    :ip-source       admin-ip-source
+                    :client-ip       ip
+                    :x-forwarded-for (get-in req [:headers "x-forwarded-for"])
+                    :x-real-ip       (get-in req [:headers "x-real-ip"])
+                    :remote-addr     (:remote-addr req)})))
+
 (defn routes [req]
   (if (and (= :get (:request-method req))
            (str/starts-with? (:uri req) "/articles/"))
@@ -405,6 +444,7 @@
     [:get "/events"]     (events req)      ; Day 5
     [:get "/ws"]         (websocket req)   ; Day 5
     [:post "/upload"]    (upload req)      ; Day 5
+    [:get "/admin"]      (admin req)       ; Day 7
     (json-response 404 {:instance instance
                         :error    "not found"
                         :uri      (:uri req)})))
