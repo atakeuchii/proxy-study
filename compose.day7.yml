@@ -1,0 +1,31 @@
+# Day 7 の構成。
+#
+#   client ──→ proxy(nginx: 8601〜8607) ──→ api-a
+#     └──────────── 直接 ──────────────────→ api-a:3000(Step 3 の比較用)
+#
+# 注意: 今日は攻撃を再現する。対象は、この Docker 環境の中だけにすること。
+name: proxy-study-day7
+
+services:
+  api-a:
+    build: .
+    image: proxy-study-api:day7
+    environment:
+      INSTANCE: a
+      WORKERS: 16
+      ACCESS_LOG: "true"
+      ADMIN_IP_SOURCE: ${ADMIN_IP_SOURCE:-xff-left}   # Step 1 の後半で x-real-ip にする
+      ADMIN_ALLOW_PREFIX: "10."                        # 10. で始まる IP を「社内」とみなす
+      JAVA_TOOL_OPTIONS: "-Xmx256m"
+
+  proxy:
+    image: nginx:stable-alpine
+    volumes:
+      - ./nginx/day7.conf:/etc/nginx/nginx.conf:ro
+    depends_on: [api-a]
+
+  client:
+    build: ./client
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./scripts:/scripts:ro
