@@ -7,6 +7,7 @@
             [ring.middleware.session.memory :refer [memory-store]]
             [ring.websocket :as ws]
             [proxy-study.redis-store :refer [redis-store]]
+            [proxy-study.auth :as auth]
             [taoensso.carmine :as car]
             [cheshire.core :as json]
             [clojure.string :as str])
@@ -425,11 +426,66 @@
                     :x-real-ip       (get-in req [:headers "x-real-ip"])
                     :remote-addr     (:remote-addr req)})))
 
+;; ---------------- Day 8: ログインが必要な画面 ----------------
+
+(def trust-auth
+  "アプリが「誰からのリクエストか」をどう判断するか(Day 8)。
+     header : nginx が付けた X-Auth-User をそのまま信じる
+     signed : トークン(Cookie の token)の署名を、アプリ自身でも検証する"
+  (env "TRUST_AUTH" "header"))
+
+(def authz
+  "注文の詳細で、データごとの認可をするか(Day 8)。
+     none  : しない(ログインしていれば、どの注文でも見られる)
+     owner : 注文の持ち主だけに見せる"
+  (env "AUTHZ" "none"))
+
+(def my-orders
+  "注文のデータ(本物のサービスでは DB にある)。"
+  {"1" {:owner "yamada" :item "Clojure 入門" :price 3200}
+   "2" {:owner "sato"   :item "nginx 実践"   :price 2800}
+   "3" {:owner "yamada" :item "Redis 詳解"   :price 4100}})
+
+(defn- current-user
+  "このリクエストは誰からか。"
+  [req]
+  (case trust-auth
+    ;; ★ ヘッダーをそのまま信じる。誰でも書ける
+    "header" (get-in req [:headers "x-auth-user"])
+    ;; ★ 署名を検証する。鍵を持たない人には作れない
+    "signed" (:user (auth/verify-token (auth/cookie-value req "token")))))
+
+(defn my-order
+  "GET /mypage/orders/:id : 自分の注文の詳細。"
+  [req]
+  (let [id    (subs (:uri req) (count "/mypage/orders/"))
+        user  (current-user req)
+        order (get my-orders id)]
+    (cond
+      (nil? user)  (json-response 401 {:error "not logged in" :trust-auth trust-auth})
+      (nil? order) (json-response 404 {:error "no such order"})
+      ;; ★ データごとの認可(ルールB): 持ち主でなければ見せない
+      (and (= authz "owner") (not= user (:owner order)))
+      (json-response 403 {:error "not your order" :you user})
+      :else
+      (json-response 200 {:you user :trust-auth trust-auth :authz authz
+                          :order (assoc order :id id)}))))
+
+(defn admin-users
+  "GET /admin/users : ユーザーの一覧。役割の確認(ルールA)は入口の nginx でしている。"
+  [req]
+  (json-response 200 {:you   (get-in req [:headers "x-auth-user"])
+                      :users (mapv (fn [[u {:keys [role]}]] {:user u :role role}) auth/users)}))
+
 (defn routes [req]
-  (if (and (= :get (:request-method req))
-           (str/starts-with? (:uri req) "/articles/"))
-    (article req)                                       ; Day 6
-    (routes* req)))
+  (let [m (:request-method req) u (:uri req)]
+    (cond
+      (and (= :get m) (str/starts-with? u "/articles/"))      (article req)        ; Day 6
+      (and (= :get m) (= u "/auth/login"))                    (auth/login req json-response) ; Day 8
+      (and (= :get m) (= u "/auth/check"))                    (auth/check req)     ; Day 8
+      (and (= :get m) (str/starts-with? u "/mypage/orders/")) (my-order req)       ; Day 8
+      (and (= :get m) (= u "/admin/users"))                   (admin-users req)    ; Day 8
+      :else (routes* req))))
 
 (defn routes* [req]
   (case [(:request-method req) (:uri req)]
