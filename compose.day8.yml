@@ -1,0 +1,43 @@
+# Day 8 の構成。
+#
+#   client ──→ proxy(nginx: 8701, 8702) ──→ api-a(アプリ)
+#                    │ auth_request
+#                    └──────────────────→ auth(認証サービス。同じ jar を別の名前で起動)
+#     └──────────── 直接 ──────────────────→ api-a:3000(Step 3: nginx を通らない経路)
+name: proxy-study-day8
+
+x-api: &api
+  build: .
+  image: proxy-study-api:day8
+
+services:
+  api-a:
+    <<: *api
+    environment:
+      INSTANCE: a
+      ACCESS_LOG: "true"
+      AUTH_SECRET: "day8-secret-change-me"     # トークンの署名の鍵(認証サービスと同じ)
+      TRUST_AUTH: ${TRUST_AUTH:-header}        # Step 3 で signed にする
+      AUTHZ: ${AUTHZ:-none}                    # Step 4 で owner にする
+      JAVA_TOOL_OPTIONS: "-Xmx256m"
+
+  auth:
+    <<: *api
+    environment:
+      INSTANCE: auth
+      ACCESS_LOG: "true"
+      AUTH_SECRET: "day8-secret-change-me"
+      JAVA_TOOL_OPTIONS: "-Xmx256m"
+
+  proxy:
+    image: nginx:stable-alpine
+    volumes:
+      - ./nginx/day8.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/day8.htpasswd:/etc/nginx/day8.htpasswd:ro
+    depends_on: [api-a, auth]
+
+  client:
+    build: ./client
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./scripts:/scripts:ro
